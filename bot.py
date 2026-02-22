@@ -1,23 +1,69 @@
 import os
+import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
+import threading
+
+from aiohttp import web
+from aiogram import Bot, Dispatcher
+from aiogram.filters import CommandStart
 from aiogram.types import Message
-from aiogram.utils import executor
 
-logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ----------------------------
+# Telegram bot logic
+# ----------------------------
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+async def main():
+    token = os.getenv("BOT_TOKEN")
 
-@dp.message_handler(commands=["start"])
-async def start(message: Message):
-    await message.answer("Привіт! Введи показники у форматі:\n120/80 70")
+    if not token:
+        raise ValueError("BOT_TOKEN is not set in environment variables")
 
-@dp.message_handler()
-async def handle_data(message: Message):
-    await message.answer(f"Отримано дані: {message.text}")
+    bot = Bot(token=token)
+    dp = Dispatcher()
+
+    @dp.message(CommandStart())
+    async def start_handler(message: Message):
+        await message.answer(
+            "Привіт 👋\n\n"
+            "Введи показники у форматі:\n"
+            "120/80 70\n\n"
+            "де 120/80 — тиск, 70 — пульс"
+        )
+
+    @dp.message()
+    async def data_handler(message: Message):
+        await message.answer(f"Отримано дані: {message.text}")
+
+    logging.info("Bot started polling...")
+    await dp.start_polling(bot)
+
+
+# ----------------------------
+# Health check server for Render
+# ----------------------------
+
+async def health_check(request):
+    return web.Response(text="OK")
+
+
+def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+
+    port = int(os.environ.get("PORT", 10000))
+    web.run_app(app, port=port)
+
+
+# ----------------------------
+# Run both services
+# ----------------------------
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    logging.basicConfig(level=logging.INFO)
+
+    # запускаємо web сервер у окремому потоці
+    threading.Thread(target=start_health_server).start()
+
+    # запускаємо Telegram бота
+    asyncio.run(main())
