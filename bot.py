@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import threading
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher
@@ -10,16 +9,32 @@ from aiogram.types import Message
 
 
 # ----------------------------
-# Telegram bot logic
+# Aiohttp health server (Render needs open PORT)
 # ----------------------------
+async def health_check(request: web.Request) -> web.Response:
+    return web.Response(text="OK")
 
-async def main():
-    token = os.getenv("BOT_TOKEN")
 
-    if not token:
-        raise ValueError("BOT_TOKEN is not set in environment variables")
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
 
-    bot = Bot(token=token)
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.environ.get("PORT", "10000"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+
+    logging.info("Health server started on port %s", port)
+    return runner
+
+
+# ----------------------------
+# Telegram bot logic (aiogram 3)
+# ----------------------------
+def build_dispatcher() -> Dispatcher:
     dp = Dispatcher()
 
     @dp.message(CommandStart())
@@ -35,35 +50,32 @@ async def main():
     async def data_handler(message: Message):
         await message.answer(f"Отримано дані: {message.text}")
 
-    logging.info("Bot started polling...")
-    await dp.start_polling(bot)
+    return dp
 
 
-# ----------------------------
-# Health check server for Render
-# ----------------------------
-
-async def health_check(request):
-    return web.Response(text="OK")
-
-
-def start_health_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-
-    port = int(os.environ.get("PORT", 10000))
-    web.run_app(app, port=port)
-
-
-# ----------------------------
-# Run both services
-# ----------------------------
-
-if __name__ == "__main__":
+async def main():
     logging.basicConfig(level=logging.INFO)
 
-    # запускаємо web сервер у окремому потоці
-    threading.Thread(target=start_health_server).start()
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise ValueError("BOT_TOKEN is not set in environment variables")
 
-    # запускаємо Telegram бота
+    # 1) Start health server first (opens PORT for Render Web Service)
+    runner = await start_health_server()
+
+    # 2) Start bot polling
+    bot = Bot(token=token)
+    dp = build_dispatcher()
+
+    try:
+        logging.info("Bot started polling...")
+        await dp.start_polling(bot)
+    finally:
+        # graceful shutdown
+        await bot.session.close()
+        await runner.cleanup()
+        logging.info("Shutdown complete.")
+
+
+if __name__ == "__main__":
     asyncio.run(main())
