@@ -366,7 +366,11 @@ async def start_health_server() -> None:
 
 async def main() -> None:
     await start_health_server()
-    print("INFO:root:Bot polling started")
+
+    # 🔥 ВАЖЛИВО — очищає попередній polling
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    print("Bot polling started")
     await dp.start_polling(bot)
 
 
