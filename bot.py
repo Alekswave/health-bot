@@ -123,11 +123,17 @@ def pulse_comment(pulse: int) -> str:
 def urgent_flags(sys: int, dia: int, pulse: int) -> list[str]:
     flags = []
     if sys >= 180 or dia >= 120:
-        flags.append("🚨 Тиск дуже високий. Якщо є біль у грудях/задишка/сильний головний біль/оніміння/порушення мови — *викликай 103*.")
+        flags.append(
+            "🚨 Тиск дуже високий. Якщо є біль у грудях/задишка/сильний головний біль/оніміння/порушення мови — *викликай 103*."
+        )
     if sys < 90 or dia < 60:
-        flags.append("⚠️ Тиск низький. Якщо є запаморочення/слабкість/непритомність — краще прилягти, вода, контроль повторно.")
+        flags.append(
+            "⚠️ Тиск низький. Якщо є запаморочення/слабкість/непритомність — приляж, вода, контроль повторно."
+        )
     if pulse >= 120:
-        flags.append("🚨 Пульс дуже високий. Якщо є біль у грудях/задишка/запаморочення — *невідкладно* звернись по допомогу.")
+        flags.append(
+            "🚨 Пульс дуже високий. Якщо є біль у грудях/задишка/запаморочення — *невідкладно* звернись по допомогу."
+        )
     return flags
 
 
@@ -161,7 +167,7 @@ def short_reco(sys: int, dia: int, pulse: int) -> str:
             "Рекомендації:\n"
             "• Посиди/відпочинь 5–10 хв, повтори вимір.\n"
             "• Уникай кофеїну/куріння найближчі 2–3 год.\n"
-            "• Якщо тримається підвищеним — краще узгодити план з лікарем."
+            "• Якщо тримається підвищеним — узгодь план з лікарем."
         )
     if sys < 90 or dia < 60:
         return (
@@ -289,7 +295,7 @@ async def cmd_history(message: Message) -> None:
 
     lines = ["*Останні 10 записів:*"]
     for dt_utc, sys, dia, pulse in rows:
-        lines.append(f"• `{dt_utc}` — *{sys}/{dia}*  pulse *{pulse}*")
+        lines.append(f"• `{dt_utc}` — *{sys}/{dia}*  пульс *{pulse}*")
     await message.answer("\n".join(lines))
 
 
@@ -330,8 +336,8 @@ async def on_text(message: Message) -> None:
     parts.append(f"• Тиск: *{sys}/{dia}*")
     parts.append(f"• Пульс: *{pulse}*")
     parts.append("")
-    parts.append(f"{cat}")
-    parts.append(f"{pcom}")
+    parts.append(cat)
+    parts.append(pcom)
 
     if trend:
         parts.append(trend)
@@ -367,11 +373,10 @@ async def start_health_server() -> None:
 async def main() -> None:
     await start_health_server()
 
-    # 🔥 ВАЖЛИВО — очищає попередній polling
+    # IMPORTANT: ensure webhook is cleared and pending updates dropped
     await bot.delete_webhook(drop_pending_updates=True)
 
-    print("Bot polling started")
-await bot.delete_webhook(drop_pending_updates=True)
+    print("INFO:root:Bot polling started")
     await dp.start_polling(bot)
 
 
