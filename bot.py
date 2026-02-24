@@ -3,24 +3,34 @@ import re
 import asyncio
 import sqlite3
 from datetime import datetime, timezone
+from typing import Optional
 
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.types import Message
 from aiogram.filters import Command
+from aiogram.types import Message, Update
 from aiogram.client.default import DefaultBotProperties
 
 
 # =========================
 # ENV
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # IMPORTANT: key must be BOT_TOKEN in Render
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in environment variables")
 
-PORT = int(os.getenv("PORT", "10000"))  # Render provides PORT
+# Render gives PORT
+PORT = int(os.getenv("PORT", "10000"))
+
+# Your public Render URL (you gave it). You can also move it to env WEBHOOK_BASE
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://health-bot-b2mv.onrender.com")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+
+# Optional extra security (Telegram secret token header)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # optional
 
 
 # =========================
@@ -68,7 +78,7 @@ async def db_fetchall(sql: str, params: tuple = ()) -> list[tuple]:
     return await asyncio.to_thread(_run)
 
 
-async def db_fetchone(sql: str, params: tuple = ()) -> tuple | None:
+async def db_fetchone(sql: str, params: tuple = ()) -> Optional[tuple]:
     def _run():
         cur = DB.cursor()
         cur.execute(sql, params)
@@ -81,32 +91,18 @@ async def db_fetchone(sql: str, params: tuple = ()) -> tuple | None:
 # ANALYSIS LOGIC
 # =========================
 def bp_category(sys: int, dia: int) -> str:
-    """
-    Simplified ESC/ACC style categories.
-    """
-    # Hypertensive crisis / very high
     if sys >= 180 or dia >= 120:
         return "🚨 *Дуже високий тиск (можливий криз)*"
-
-    # Hypertension grades
     if sys >= 160 or dia >= 100:
         return "🔴 *Гіпертензія 2 ступеня*"
     if sys >= 140 or dia >= 90:
         return "🟠 *Гіпертензія 1 ступеня*"
-
-    # High-normal
     if sys >= 130 or dia >= 85:
         return "🟡 *Високий нормальний*"
-
-    # Normal
     if sys >= 120 and dia < 80:
         return "🟢 *Нормальний*"
-
-    # Optimal / low-normal
     if sys < 120 and dia < 80:
         return "🟢 *Оптимальний*"
-
-    # Fallback (mixed cases)
     return "ℹ️ *Змішаний діапазон*"
 
 
@@ -128,7 +124,7 @@ def urgent_flags(sys: int, dia: int, pulse: int) -> list[str]:
         )
     if sys < 90 or dia < 60:
         flags.append(
-            "⚠️ Тиск низький. Якщо є запаморочення/слабкість/непритомність — приляж, вода, контроль повторно."
+            "⚠️ Тиск низький. Якщо є запаморочення/слабкість/непритомність — прилягти, вода, повторний контроль."
         )
     if pulse >= 120:
         flags.append(
@@ -137,22 +133,13 @@ def urgent_flags(sys: int, dia: int, pulse: int) -> list[str]:
     return flags
 
 
-def trend_comment(rows: list[tuple]) -> str | None:
-    """
-    rows: list of (dt_utc, sys, dia, pulse) ordered DESC, latest first.
-    Compare last 3 measurements if available.
-    """
+def trend_comment(rows: list[tuple]) -> Optional[str]:
     if len(rows) < 3:
         return None
-
-    # take latest 3
     s1, d1 = rows[0][1], rows[0][2]
     s3, d3 = rows[2][1], rows[2][2]
-
     ds = s1 - s3
     dd = d1 - d3
-
-    # thresholds for trend
     if ds >= 10 or dd >= 6:
         return "📈 Є тенденція *до підвищення* за останні 3 вимірювання."
     if ds <= -10 or dd <= -6:
@@ -161,7 +148,6 @@ def trend_comment(rows: list[tuple]) -> str | None:
 
 
 def short_reco(sys: int, dia: int, pulse: int) -> str:
-    # short actionable tips (non-prescriptive)
     if sys >= 140 or dia >= 90:
         return (
             "Рекомендації:\n"
@@ -179,9 +165,9 @@ def short_reco(sys: int, dia: int, pulse: int) -> str:
     if pulse >= 100:
         return (
             "Рекомендації:\n"
-            "• Відпочинь 5–10 хв, дихання повільне.\n"
-            "• Перевір, чи не було кофеїну/стресу/фізнавантаження.\n"
-            "• Якщо часто повторюється — варто обговорити з лікарем."
+            "• Відпочинь 5–10 хв, повільне дихання.\n"
+            "• Перевір, чи не було кофеїну/стресу/навантаження.\n"
+            "• Якщо часто повторюється — обговори з лікарем."
         )
     return (
         "Рекомендації:\n"
@@ -196,7 +182,7 @@ def short_reco(sys: int, dia: int, pulse: int) -> str:
 MEASURE_RE = re.compile(r"^\s*(\d{2,3})\s*/\s*(\d{2,3})\s+(\d{2,3})\s*$")
 
 
-def parse_measurement(text: str) -> tuple[int, int, int] | None:
+def parse_measurement(text: str) -> Optional[tuple[int, int, int]]:
     m = MEASURE_RE.match(text)
     if not m:
         return None
@@ -204,7 +190,6 @@ def parse_measurement(text: str) -> tuple[int, int, int] | None:
     dia = int(m.group(2))
     pulse = int(m.group(3))
 
-    # sanity checks (basic)
     if not (60 <= sys <= 260):
         return None
     if not (40 <= dia <= 160):
@@ -215,7 +200,7 @@ def parse_measurement(text: str) -> tuple[int, int, int] | None:
 
 
 # =========================
-# BOT SETUP (aiogram 3.7+ correct)
+# BOT SETUP (aiogram 3.7+)
 # =========================
 bot = Bot(
     token=BOT_TOKEN,
@@ -295,7 +280,7 @@ async def cmd_history(message: Message) -> None:
 
     lines = ["*Останні 10 записів:*"]
     for dt_utc, sys, dia, pulse in rows:
-        lines.append(f"• `{dt_utc}` — *{sys}/{dia}*  пульс *{pulse}*")
+        lines.append(f"• `{dt_utc}` — *{sys}/{dia}*  pulse *{pulse}*")
     await message.answer("\n".join(lines))
 
 
@@ -319,7 +304,6 @@ async def on_text(message: Message) -> None:
         (user_id, dt_utc, sys, dia, pulse),
     )
 
-    # Fetch last 10 for trend
     last_rows = await db_fetchall(
         "SELECT dt_utc, sys, dia, pulse FROM measurements WHERE user_id = ? ORDER BY id DESC LIMIT 10",
         (user_id,),
@@ -331,54 +315,73 @@ async def on_text(message: Message) -> None:
     trend = trend_comment(last_rows)
     reco = short_reco(sys, dia, pulse)
 
-    parts = []
-    parts.append("✅ *Дані збережено*")
-    parts.append(f"• Тиск: *{sys}/{dia}*")
-    parts.append(f"• Пульс: *{pulse}*")
-    parts.append("")
-    parts.append(cat)
-    parts.append(pcom)
+    parts = [
+        "✅ *Дані збережено*",
+        f"• Тиск: *{sys}/{dia}*",
+        f"• Пульс: *{pulse}*",
+        "",
+        cat,
+        pcom,
+    ]
 
     if trend:
         parts.append(trend)
 
     if flags:
-        parts.append("")
-        parts.append("*Увага:*")
+        parts.extend(["", "*Увага:*"])
         parts.extend([f"• {f}" for f in flags])
 
-    parts.append("")
-    parts.append(reco)
-
+    parts.extend(["", reco])
     await message.answer("\n".join(parts))
 
 
 # =========================
-# HEALTH SERVER (Render port binding)
+# WEBHOOK (aiohttp)
 # =========================
-async def handle_root(request: web.Request) -> web.Response:
+async def telegram_webhook(request: web.Request) -> web.Response:
+    if WEBHOOK_SECRET:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if header_secret != WEBHOOK_SECRET:
+            return web.Response(status=403, text="forbidden")
+
+    data = await request.json()
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
+    return web.Response(text="ok")
+
+
+async def health(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
-async def start_health_server() -> None:
+async def on_startup(app: web.Application) -> None:
+    # Set webhook (Telegram will send updates to Render URL)
+    await bot.set_webhook(
+        url=WEBHOOK_URL,
+        drop_pending_updates=True,
+        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+    )
+    print(f"Webhook set to: {WEBHOOK_URL}")
+
+
+async def on_shutdown(app: web.Application) -> None:
+    # Optional: remove webhook on shutdown
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        pass
+    await bot.session.close()
+
+
+def create_app() -> web.Application:
     app = web.Application()
-    app.router.add_get("/", handle_root)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-    print(f"INFO:root:Health server started on port {PORT}")
+    app.router.add_get("/", health)
+    app.router.add_post(WEBHOOK_PATH, telegram_webhook)
 
-
-async def main() -> None:
-    await start_health_server()
-
-    # IMPORTANT: ensure webhook is cleared and pending updates dropped
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    print("INFO:root:Bot polling started")
-    await dp.start_polling(bot)
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    return app
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(create_app(), host="0.0.0.0", port=PORT)
