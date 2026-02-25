@@ -3,15 +3,16 @@ import re
 import asyncio
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional
 
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, Update
+from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
+
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 
 # =========================
@@ -21,16 +22,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN is not set in environment variables")
 
-# Render gives PORT
 PORT = int(os.getenv("PORT", "10000"))
 
-# Your public Render URL (you gave it). You can also move it to env WEBHOOK_BASE
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://health-bot-b2mv.onrender.com")
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+# Render часто підставляє зовнішній URL як RENDER_EXTERNAL_URL.
+# Якщо раптом його нема — задай WEBHOOK_BASE_URL вручну у Render.
+WEBHOOK_BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_BASE_URL")
+if not WEBHOOK_BASE_URL:
+    raise ValueError("WEBHOOK_BASE_URL (or RENDER_EXTERNAL_URL) is not set")
 
-# Optional extra security (Telegram secret token header)
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # optional
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = WEBHOOK_BASE_URL.rstrip("/") + WEBHOOK_PATH
 
 
 # =========================
@@ -78,7 +79,7 @@ async def db_fetchall(sql: str, params: tuple = ()) -> list[tuple]:
     return await asyncio.to_thread(_run)
 
 
-async def db_fetchone(sql: str, params: tuple = ()) -> Optional[tuple]:
+async def db_fetchone(sql: str, params: tuple = ()) -> tuple | None:
     def _run():
         cur = DB.cursor()
         cur.execute(sql, params)
@@ -119,21 +120,15 @@ def pulse_comment(pulse: int) -> str:
 def urgent_flags(sys: int, dia: int, pulse: int) -> list[str]:
     flags = []
     if sys >= 180 or dia >= 120:
-        flags.append(
-            "🚨 Тиск дуже високий. Якщо є біль у грудях/задишка/сильний головний біль/оніміння/порушення мови — *викликай 103*."
-        )
+        flags.append("🚨 Тиск дуже високий. Якщо є біль у грудях/задишка/сильний головний біль/оніміння/порушення мови — *викликай 103*.")
     if sys < 90 or dia < 60:
-        flags.append(
-            "⚠️ Тиск низький. Якщо є запаморочення/слабкість/непритомність — прилягти, вода, повторний контроль."
-        )
+        flags.append("⚠️ Тиск низький. Якщо є запаморочення/слабкість/непритомність — краще прилягти, вода, контроль повторно.")
     if pulse >= 120:
-        flags.append(
-            "🚨 Пульс дуже високий. Якщо є біль у грудях/задишка/запаморочення — *невідкладно* звернись по допомогу."
-        )
+        flags.append("🚨 Пульс дуже високий. Якщо є біль у грудях/задишка/запаморочення — *невідкладно* звернись по допомогу.")
     return flags
 
 
-def trend_comment(rows: list[tuple]) -> Optional[str]:
+def trend_comment(rows: list[tuple]) -> str | None:
     if len(rows) < 3:
         return None
     s1, d1 = rows[0][1], rows[0][2]
@@ -153,7 +148,7 @@ def short_reco(sys: int, dia: int, pulse: int) -> str:
             "Рекомендації:\n"
             "• Посиди/відпочинь 5–10 хв, повтори вимір.\n"
             "• Уникай кофеїну/куріння найближчі 2–3 год.\n"
-            "• Якщо тримається підвищеним — узгодь план з лікарем."
+            "• Якщо тримається підвищеним — краще узгодити план з лікарем."
         )
     if sys < 90 or dia < 60:
         return (
@@ -165,9 +160,9 @@ def short_reco(sys: int, dia: int, pulse: int) -> str:
     if pulse >= 100:
         return (
             "Рекомендації:\n"
-            "• Відпочинь 5–10 хв, повільне дихання.\n"
-            "• Перевір, чи не було кофеїну/стресу/навантаження.\n"
-            "• Якщо часто повторюється — обговори з лікарем."
+            "• Відпочинь 5–10 хв, дихання повільне.\n"
+            "• Перевір, чи не було кофеїну/стресу/фізнавантаження.\n"
+            "• Якщо часто повторюється — варто обговорити з лікарем."
         )
     return (
         "Рекомендації:\n"
@@ -182,14 +177,13 @@ def short_reco(sys: int, dia: int, pulse: int) -> str:
 MEASURE_RE = re.compile(r"^\s*(\d{2,3})\s*/\s*(\d{2,3})\s+(\d{2,3})\s*$")
 
 
-def parse_measurement(text: str) -> Optional[tuple[int, int, int]]:
+def parse_measurement(text: str) -> tuple[int, int, int] | None:
     m = MEASURE_RE.match(text)
     if not m:
         return None
     sys = int(m.group(1))
     dia = int(m.group(2))
     pulse = int(m.group(3))
-
     if not (60 <= sys <= 260):
         return None
     if not (40 <= dia <= 160):
@@ -200,7 +194,7 @@ def parse_measurement(text: str) -> Optional[tuple[int, int, int]]:
 
 
 # =========================
-# BOT SETUP (aiogram 3.7+)
+# BOT SETUP
 # =========================
 bot = Bot(
     token=BOT_TOKEN,
@@ -257,7 +251,6 @@ async def cmd_last(message: Message) -> None:
     if not row:
         await message.answer("Поки що немає записів. Надішли показники у форматі `120/80 70`.")
         return
-
     dt_utc, sys, dia, pulse = row
     await message.answer(
         f"*Останній запис:*\n"
@@ -320,68 +313,56 @@ async def on_text(message: Message) -> None:
         f"• Тиск: *{sys}/{dia}*",
         f"• Пульс: *{pulse}*",
         "",
-        cat,
-        pcom,
+        f"{cat}",
+        f"{pcom}",
     ]
 
     if trend:
         parts.append(trend)
 
     if flags:
-        parts.extend(["", "*Увага:*"])
+        parts.append("")
+        parts.append("*Увага:*")
         parts.extend([f"• {f}" for f in flags])
 
-    parts.extend(["", reco])
+    parts.append("")
+    parts.append(reco)
+
     await message.answer("\n".join(parts))
 
 
 # =========================
-# WEBHOOK (aiohttp)
+# AIOHTTP APP + WEBHOOK
 # =========================
-async def telegram_webhook(request: web.Request) -> web.Response:
-    if WEBHOOK_SECRET:
-        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if header_secret != WEBHOOK_SECRET:
-            return web.Response(status=403, text="forbidden")
-
-    data = await request.json()
-    update = Update.model_validate(data)
-    await dp.feed_update(bot, update)
-    return web.Response(text="ok")
-
-
-async def health(request: web.Request) -> web.Response:
+async def handle_root(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
 async def on_startup(app: web.Application) -> None:
-    # Set webhook (Telegram will send updates to Render URL)
-    await bot.set_webhook(
-        url=WEBHOOK_URL,
-        drop_pending_updates=True,
-        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
-    )
+    # Ставимо webhook (Telegram буде штовхати апдейти на /webhook)
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
     print(f"Webhook set to: {WEBHOOK_URL}")
 
 
 async def on_shutdown(app: web.Application) -> None:
-    # Optional: remove webhook on shutdown
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-    except Exception:
-        pass
+    await bot.delete_webhook()
     await bot.session.close()
 
 
-def create_app() -> web.Application:
+def main() -> None:
     app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_post(WEBHOOK_PATH, telegram_webhook)
+    app.router.add_get("/", handle_root)
+
+    # Прив'язка aiogram до aiohttp
+    request_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    request_handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
-    return app
+
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host="0.0.0.0", port=PORT)
+    main()
