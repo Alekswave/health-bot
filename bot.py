@@ -1,30 +1,38 @@
-import asyncio
-import io
-import logging
 import os
 import re
+import io
+import logging
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
 from aiohttp import web
+import matplotlib.pyplot as plt
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import Message, BufferedInputFile, Update
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# ---------------------------
+
+# =====================================
 # CONFIG
-# ---------------------------
+# =====================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Add it to Render Environment variables.")
+    raise RuntimeError("BOT_TOKEN is not set in Render Environment Variables")
 
-# Render sets PORT for Web Service
 PORT = int(os.getenv("PORT", "10000"))
-
-# DB path (Render free can be ephemeral)
 DB_PATH = os.getenv("DB_PATH", "health.db")
+
+# Render usually provides this automatically for Web Service
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+if not BASE_URL:
+    raise RuntimeError("RENDER_EXTERNAL_URL is not available")
+
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,9 +43,9 @@ bp_regex = re.compile(
 )
 
 
-# ---------------------------
-# DB
-# ---------------------------
+# =====================================
+# DATABASE
+# =====================================
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS measurements (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,6 +56,7 @@ CREATE TABLE IF NOT EXISTS measurements (
   created_at TEXT NOT NULL
 );
 """
+
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -68,7 +77,13 @@ async def save_measurement(user_id: int, sys_: int, dia: int, pulse: int):
 async def fetch_last(user_id: int, limit: int = 10):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT systolic, diastolic, pulse, created_at FROM measurements WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            """
+            SELECT systolic, diastolic, pulse, created_at
+            FROM measurements
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
             (user_id, limit)
         )
         rows = await cur.fetchall()
@@ -78,28 +93,30 @@ async def fetch_last(user_id: int, limit: int = 10):
 async def fetch_range(user_id: int, since_utc: datetime):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT systolic, diastolic, pulse, created_at FROM measurements WHERE user_id=? AND created_at>=? ORDER BY created_at ASC",
+            """
+            SELECT systolic, diastolic, pulse, created_at
+            FROM measurements
+            WHERE user_id = ? AND created_at >= ?
+            ORDER BY created_at ASC
+            """,
             (user_id, since_utc.isoformat())
         )
         rows = await cur.fetchall()
     return rows
 
 
-# ---------------------------
-# HEALTH LOGIC (simple, safe)
-# ---------------------------
+# =====================================
+# SIMPLE HEALTH LOGIC
+# =====================================
 def classify_bp(sys_: int, dia: int) -> str:
-    """
-    Rough classification (not medical advice).
-    """
     if sys_ >= 180 or dia >= 120:
-        return "🚨 Дуже високий тиск (кризовий рівень). Якщо самопочуття погане — звернись по невідкладну допомогу."
+        return "🚨 Дуже високий тиск. Якщо погане самопочуття — звернись по невідкладну допомогу."
     if sys_ >= 140 or dia >= 90:
-        return "⚠️ Підвищений тиск (гіпертензія)."
+        return "⚠️ Підвищений тиск."
     if 120 <= sys_ <= 129 and dia < 80:
-        return "ℹ️ Тиск трохи підвищений (пограничний)."
+        return "ℹ️ Тиск трохи підвищений."
     if sys_ < 90 or dia < 60:
-        return "⚠️ Знижений тиск (гіпотензія)."
+        return "⚠️ Знижений тиск."
     return "✅ Тиск у межах норми."
 
 
@@ -115,35 +132,28 @@ def classify_pulse(pulse: int) -> str:
 
 def validate_values(sys_: int, dia: int, pulse: int) -> str | None:
     if not (60 <= sys_ <= 260):
-        return "Систолічний тиск виглядає некоректно. Перевір формат (наприклад: 120/80 68)."
+        return "Систолічний тиск виглядає некоректно. Спробуй формат: 120/80 68"
     if not (40 <= dia <= 160):
-        return "Діастолічний тиск виглядає некоректно. Перевір формат (наприклад: 120/80 68)."
+        return "Діастолічний тиск виглядає некоректно. Спробуй формат: 120/80 68"
     if dia >= sys_:
-        return "Діастолічний не може бути >= систолічного. Перевір дані."
+        return "Діастолічний не може бути більшим або рівним систолічному."
     if not (35 <= pulse <= 220):
-        return "Пульс виглядає некоректно. Перевір дані."
+        return "Пульс виглядає некоректно."
     return None
 
 
-# ---------------------------
+# =====================================
 # CHART
-# ---------------------------
+# =====================================
 def make_chart_png(points: list[tuple[int, int, int, str]]) -> bytes:
-    """
-    points: [(sys, dia, pulse, created_at_iso), ...] ASC by time
-    """
-    import matplotlib.pyplot as plt  # local import for faster boot in some envs
-
     times = []
     sys_vals = []
     dia_vals = []
     pulse_vals = []
 
     for sys_, dia, pulse, ts in points:
-        dt = datetime.fromisoformat(ts)
-        # show in local-ish time: UTC+2 (you can change)
-        dt_local = dt.astimezone(timezone(timedelta(hours=2)))
-        times.append(dt_local)
+        dt = datetime.fromisoformat(ts).astimezone(timezone(timedelta(hours=2)))
+        times.append(dt)
         sys_vals.append(sys_)
         dia_vals.append(dia)
         pulse_vals.append(pulse)
@@ -167,37 +177,14 @@ def make_chart_png(points: list[tuple[int, int, int, str]]) -> bytes:
     return buf.getvalue()
 
 
-# ---------------------------
-# WEB SERVER (for Render port)
-# ---------------------------
-async def health_handler(request):
-    return web.Response(text="ok")
-
-async def create_web_app():
-    app = web.Application()
-    app.router.add_get("/health", health_handler)
-    app.router.add_get("/", health_handler)
-    return app
-
-async def run_web_server():
-    app = await create_web_app()
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"Health server started on port {PORT}")
-    # keep alive
-    while True:
-        await asyncio.sleep(3600)
-
-
-# ---------------------------
+# =====================================
 # BOT
-# ---------------------------
+# =====================================
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
+
 dp = Dispatcher()
 
 
@@ -206,12 +193,14 @@ async def cmd_start(message: Message):
     text = (
         "Привіт! Я бот для моніторингу тиску 😊\n\n"
         "Надішли показники у форматі:\n"
-        "<b>120/80 68</b>\n"
-        "де 120 — систолічний, 80 — діастолічний, 68 — пульс.\n\n"
+        "<b>120/80 68</b>\n\n"
+        "де 120 — систолічний,\n"
+        "80 — діастолічний,\n"
+        "68 — пульс.\n\n"
         "Команди:\n"
         "• /history — останні 10 вимірювань\n"
         "• /stats — статистика за 7 днів\n"
-        "• /chart — графік за 7 днів\n"
+        "• /chart — графік за 7 днів"
     )
     await message.answer(text)
 
@@ -244,7 +233,8 @@ async def cmd_stats(message: Message):
     dia_vals = [r[1] for r in rows]
     pulse_vals = [r[2] for r in rows]
 
-    def avg(x): return sum(x) / len(x)
+    def avg(x):
+        return sum(x) / len(x)
 
     text = (
         "<b>Статистика за 7 днів:</b>\n"
@@ -252,7 +242,7 @@ async def cmd_stats(message: Message):
         f"• Середній тиск: <b>{avg(sys_vals):.0f}/{avg(dia_vals):.0f}</b>\n"
         f"• Мін/Макс SYS: <b>{min(sys_vals)}</b> / <b>{max(sys_vals)}</b>\n"
         f"• Мін/Макс DIA: <b>{min(dia_vals)}</b> / <b>{max(dia_vals)}</b>\n"
-        f"• Середній пульс: <b>{avg(pulse_vals):.0f}</b>\n"
+        f"• Середній пульс: <b>{avg(pulse_vals):.0f}</b>"
     )
     await message.answer(text)
 
@@ -263,7 +253,7 @@ async def cmd_chart(message: Message):
     rows = await fetch_range(message.from_user.id, since)
 
     if len(rows) < 2:
-        await message.answer("Для графіка потрібно хоча б 2 вимірювання за 7 днів.")
+        await message.answer("Для графіка потрібно хоча б 2 вимірювання за останні 7 днів.")
         return
 
     png = make_chart_png(rows)
@@ -294,27 +284,56 @@ async def handle_text(message: Message):
     bp_status = classify_bp(sys_, dia)
     pulse_status = classify_pulse(pulse)
 
-    # коротка відповідь + підказка
     reply = (
         f"✅ Збережено: <b>{sys_}/{dia}</b> пульс <b>{pulse}</b>\n\n"
-        f"{bp_status}\n{pulse_status}\n\n"
+        f"{bp_status}\n"
+        f"{pulse_status}\n\n"
         "Подивитись історію: /history\n"
         "Статистика: /stats\n"
-        "Графік: /chart\n"
+        "Графік: /chart\n\n"
         "<i>Це не медична консультація.</i>"
     )
     await message.answer(reply)
 
 
-async def main():
-    await init_db()
+# =====================================
+# AIOHTTP APP FOR RENDER + WEBHOOK
+# =====================================
+async def health_handler(request: web.Request):
+    return web.Response(text="ok")
 
-    # Run polling + web server together
-    await asyncio.gather(
-        run_web_server(),
-        dp.start_polling(bot),
+
+async def on_startup(app: web.Application):
+    await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    logger.info(f"Webhook set to: {WEBHOOK_URL}")
+
+
+async def on_shutdown(app: web.Application):
+    await bot.delete_webhook()
+    await bot.session.close()
+
+
+def main():
+    app = web.Application()
+
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot
     )
+    webhook_handler.register(app, path=WEBHOOK_PATH)
+
+    setup_application(app, dp, bot=bot)
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
